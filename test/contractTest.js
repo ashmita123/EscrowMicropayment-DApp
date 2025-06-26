@@ -1,44 +1,91 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
-describe("Counter Contract", function () {
-    let Counter;
-    let counter;
-    let owner;
-    let addr1;
-    let addr2;
+describe("EscrowMicroPay", function () {
+  let stableToken;
+  let escrow;
+  let owner;
+  let user;
+  let serviceOwner;
 
-    beforeEach(async function () {
-        // Deploying the contract before each test
-        Counter = await ethers.getContractFactory("Counter");
-        [owner, addr1, addr2] = await ethers.getSigners();
-        counter = await Counter.deploy();
-        await counter.deployed();
-    });
+  const DECIMALS = 6;
+  const toUnits = (amount) => ethers.utils.parseUnits(amount.toString(), DECIMALS);
 
-    it("Should initialize with the value set by the organizer", async function () {
-        // Only the organizer (owner) can set the initial value
-        await counter.initialize(10);
-        expect(await counter.value()).to.equal(10);
-    });
+  beforeEach(async () => {
+    [owner, user, serviceOwner, other] = await ethers.getSigners();
 
-    it("Should prevent non-organizers from initializing the counter", async function () {
-        // Attempting initialization from a non-organizer account
-        await expect(counter.connect(addr1).initialize(10)).to.be.revertedWith("Only the organizer can perform this action.");
-    });
+    const MockUSDC = await ethers.getContractFactory("MockUSDC");
+    stableToken = await MockUSDC.deploy();
+    await stableToken.deployed();
 
-    it("Should increment the counter value", async function () {
-        // Initializing the counter first
-        await counter.initialize(10);
-        // Incrementing the counter
-        await counter.increment(5);
-        expect(await counter.value()).to.equal(15);
-    });
+    // Transfer 100 tokens to user
+    await stableToken.transfer(user.address, toUnits(100));
 
-    it("Should decrement the counter value", async function () {
-        // Initializing and decrementing the counter
-        await counter.initialize(10);
-        await counter.decrement(3);
-        expect(await counter.value()).to.equal(7);
-    });
+    const EscrowMicroPay = await ethers.getContractFactory("EscrowMicroPay");
+    escrow = await EscrowMicroPay.deploy(
+      owner.address,
+      stableToken.address,
+      ethers.utils.formatBytes32String("Service1"),
+      serviceOwner.address
+    );
+    await escrow.deployed();
+  });
+
+  it("should allow user to deposit tokens", async () => {
+    const depositAmount = toUnits(10);
+
+    await stableToken.connect(user).approve(escrow.address, depositAmount);
+    await expect(escrow.connect(user).deposit(depositAmount))
+      .to.emit(escrow, "Deposited")
+      .withArgs(user.address, depositAmount, await escrow.serviceId());
+
+    expect(await escrow.balanceOf(user.address)).to.equal(depositAmount);
+    expect(await stableToken.balanceOf(escrow.address)).to.equal(depositAmount);
+  });
+
+  it("should allow service owner to release tokens", async () => {
+    const depositAmount = toUnits(10);
+
+    await stableToken.connect(user).approve(escrow.address, depositAmount);
+    await escrow.connect(user).deposit(depositAmount);
+
+    await expect(escrow.connect(serviceOwner).release(user.address, depositAmount))
+      .to.emit(escrow, "Released")
+      .withArgs(user.address, depositAmount, serviceOwner.address, await escrow.serviceId());
+
+    expect(await escrow.balanceOf(user.address)).to.equal(0);
+    expect(await stableToken.balanceOf(serviceOwner.address)).to.equal(depositAmount);
+  });
+
+  it("should fail if non-service owner tries to release", async () => {
+    await expect(
+      escrow.connect(user).release(user.address, toUnits(1))
+    ).to.be.revertedWith("Escrow: caller not serviceOwner");
+  });
+
+  it("should allow contract owner to set a new service owner", async () => {
+    await escrow.connect(owner).setServiceOwner(user.address);
+    expect(await escrow.serviceOwner()).to.equal(user.address);
+  });
+
+  it("should allow contract owner to rescue tokens", async () => {
+    const depositAmount = toUnits(10);
+
+    // Approve and deposit from user
+    await stableToken.connect(user).approve(escrow.address, depositAmount);
+    await escrow.connect(user).deposit(depositAmount);
+
+    // Get owner balance before rescue
+    const balanceBefore = await stableToken.balanceOf(owner.address);
+
+    // Rescue tokens
+    await escrow.connect(owner).rescueTokens(owner.address);
+
+    // Get owner balance after
+    const balanceAfter = await stableToken.balanceOf(owner.address);
+
+    // Check delta
+    const delta = balanceAfter.sub(balanceBefore);
+    expect(delta).to.equal(depositAmount);
+  });
 });
